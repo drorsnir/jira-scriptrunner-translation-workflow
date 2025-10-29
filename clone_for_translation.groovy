@@ -5,6 +5,7 @@ import java.time.format.DateTimeFormatter
 @Field static final boolean DEBUG = false  // Set to true for detailed debug output
 
 @Field static final String CLONED_LABEL = 'cloned_for_translation'
+@Field static final String LOCK_LABEL = 'locked_by_automation'  // Temporary lock to prevent race conditions
 
 // Configuration for error notifications
 @Field static final String NOTIFICATION_EMAIL = "admin@example.com" // TODO: Replace with your email
@@ -338,6 +339,15 @@ boolean needsTranslation(Map<String, Object> issue, String lang) {
             ])
             return false
         }
+
+        // Skip if locked by another automation (race condition prevention)
+        if (labels.contains(LOCK_LABEL)) {
+            log('WARN', "Issue locked by another automation, skipping", [
+                issueKey: issueKey,
+                language: lang
+            ])
+            return false
+        }
         
         String issueTypeName = (fields['issuetype'] as Map<String, Object>)['name'] as String
         log('INFO', """Issue Type: ${issueTypeName}
@@ -589,28 +599,40 @@ ${fields.collect { key, value -> "${key}: (${value?.getClass()?.name}) ${groovy.
                 addError(linkErrorInfo)
             }
             
-            // Add the cloned label to the original issue
-            if (!isSubtask) {  // Only add label to parent issues
+            // Update labels on the original issue: remove lock, add cloned marker
+            if (!isSubtask) {  // Only update labels on parent issues
                 List<String> currentLabels = originalIssue['fields']['labels'] as List<String> ?: []
+
+                // Remove lock label
+                currentLabels.remove(LOCK_LABEL)
+
+                // Add cloned label
                 if (!currentLabels.contains(CLONED_LABEL)) {
                     currentLabels.add(CLONED_LABEL)
-                    def labelResponse = put("/rest/api/3/issue/${originalKey}")
-                        .header('Content-Type', 'application/json')
-                        .body([
-                            fields: [
-                                labels: currentLabels
-                            ]
-                        ])
-                        .asObject(Map)
-                    
-                    if (labelResponse['status'] != 204) {
-                        log('WARN', "Failed to add cloned label", [
-                            issueKey: originalKey,
-                            status: labelResponse['status'],
-                            body: labelResponse['body']
-                        ])
-                        // Non-critical error, don't add to EXECUTION_ERRORS
-                    }
+                }
+
+                def labelResponse = put("/rest/api/3/issue/${originalKey}")
+                    .header('Content-Type', 'application/json')
+                    .body([
+                        fields: [
+                            labels: currentLabels
+                        ]
+                    ])
+                    .asObject(Map)
+
+                if (labelResponse['status'] != 204) {
+                    log('WARN', "Failed to update labels on original issue", [
+                        issueKey: originalKey,
+                        status: labelResponse['status'],
+                        body: labelResponse['body']
+                    ])
+                    // Non-critical error, don't add to EXECUTION_ERRORS
+                } else {
+                    log('INFO', "Updated labels on original issue", [
+                        issueKey: originalKey,
+                        removedLabel: LOCK_LABEL,
+                        addedLabel: CLONED_LABEL
+                    ])
                 }
             }
 
@@ -679,6 +701,25 @@ void processIssue(Map<String, Object> currentIssue, String lang) {
     ])
 
     try {
+        // Add lock label to prevent race conditions with other automation
+        List<String> currentLabels = fields['labels'] as List<String> ?: []
+        if (!currentLabels.contains(LOCK_LABEL)) {
+            currentLabels.add(LOCK_LABEL)
+            def lockResponse = put("/rest/api/3/issue/${issueKey}")
+                .header('Content-Type', 'application/json')
+                .body([fields: [labels: currentLabels]])
+                .asObject(Map)
+
+            if (lockResponse['status'] == 204) {
+                log('INFO', "Added lock label to issue", [issueKey: issueKey])
+            } else {
+                log('WARN', "Failed to add lock label", [
+                    issueKey: issueKey,
+                    status: lockResponse['status']
+                ])
+            }
+        }
+
         if (needsTranslation(currentIssue, lang)) {
             log('INFO', "Creating translation issue", [
                 sourceKey: issueKey,
@@ -759,12 +800,16 @@ void processIssue(Map<String, Object> currentIssue, String lang) {
                     error: result['message']
                 ])
                 // Error already added in createIssue
+                // Remove lock so issue can be retried
+                removeLockLabel(issueKey, fields)
             }
         } else {
             log('INFO', "No translation needed", [
                 issueKey: issueKey,
                 language: lang
             ])
+            // Remove lock since we're not processing
+            removeLockLabel(issueKey, fields)
         }
     } catch (Exception e) {
         Map<String, Object> errorInfo = [
@@ -776,12 +821,40 @@ void processIssue(Map<String, Object> currentIssue, String lang) {
             stackTrace: e.stackTrace.take(5)*.toString(),
             critical: true
         ]
-        
+
         log('ERROR', "Exception in processIssue", errorInfo)
         addError(errorInfo)
-        
+
+        // Remove lock so issue can be retried
+        try {
+            removeLockLabel(issueKey, fields)
+        } catch (Exception lockEx) {
+            log('WARN', "Failed to remove lock after exception", [issueKey: issueKey, error: lockEx.message])
+        }
+
         // Re-throw to be caught by main execution
         throw e
+    }
+}
+
+// Helper function to remove lock label
+void removeLockLabel(String issueKey, Map<String, Object> fields) {
+    List<String> currentLabels = fields['labels'] as List<String> ?: []
+    if (currentLabels.contains(LOCK_LABEL)) {
+        currentLabels.remove(LOCK_LABEL)
+        def unlockResponse = put("/rest/api/3/issue/${issueKey}")
+            .header('Content-Type', 'application/json')
+            .body([fields: [labels: currentLabels]])
+            .asObject(Map)
+
+        if (unlockResponse['status'] == 204) {
+            log('INFO', "Removed lock label from issue", [issueKey: issueKey])
+        } else {
+            log('WARN', "Failed to remove lock label", [
+                issueKey: issueKey,
+                status: unlockResponse['status']
+            ])
+        }
     }
 }
 
