@@ -16,8 +16,12 @@ import java.time.format.DateTimeFormatter
 
 @Field static final String PROJECT_KEY = 'KOL'  // Change this to your project key
 @Field static final int LOOKBACK_MONTHS = 5  // Only look back this many months
+@Field static final int MAX_ISSUES_TO_PROCESS = 0  // 0 = unlimited, set to limit processing (e.g., 200)
 @Field static final String CLONED_LABEL = 'cloned_for_translation'
 @Field static final boolean DEBUG = false  // Set to true to see detailed debug for each issue
+
+// Cache for subtask details to avoid duplicate fetches
+@Field static final Map<String, Map<String, Object>> subtaskCache = [:]
 
 @Field static final Map<String, String> FIELD_IDS = [
     LANGUAGE: 'customfield_10305',
@@ -60,10 +64,17 @@ import java.time.format.DateTimeFormatter
 @Field static final List<Map<String, Object>> russianIssues = []
 
 Map<String, Object> getSubtaskDetails(String subtaskKey) {
+    // Check cache first
+    if (subtaskCache.containsKey(subtaskKey)) {
+        return subtaskCache[subtaskKey]
+    }
+
     try {
         def response = get("/rest/api/3/issue/${subtaskKey}").asObject(Map)
         if (response['status'] == 200) {
-            return response['body'] as Map<String, Object>
+            Map<String, Object> subtaskData = response['body'] as Map<String, Object>
+            subtaskCache[subtaskKey] = subtaskData
+            return subtaskData
         }
     } catch (Exception e) {
         println "ERROR: Failed to fetch subtask ${subtaskKey}: ${e.message}"
@@ -71,46 +82,36 @@ Map<String, Object> getSubtaskDetails(String subtaskKey) {
     return null
 }
 
-boolean needsTranslation(Map<String, Object> issue, String lang) {
-    String issueKey = issue['key'] as String
+// Check if parent issue qualifies (without checking subtasks)
+boolean parentQualifiesForTranslation(Map<String, Object> issue, String lang) {
     Map<String, Object> fields = issue['fields'] as Map<String, Object>
-
-    if (DEBUG) println "  Checking ${issueKey} for ${lang}..."
 
     // Check if issue is resolved
     if (!fields['resolution']) {
-        if (DEBUG) println "    ❌ No resolution"
         return false
     }
 
     // Check resolution exclusions
     String resolutionName = (fields['resolution'] as Map<String, Object>)['name'] as String
     if (EXCLUDED_RESOLUTIONS.contains(resolutionName)) {
-        if (DEBUG) println "    ❌ Excluded resolution: ${resolutionName}"
         return false
     }
 
     List<String> labels = fields['labels'] as List<String> ?: []
     // Check for cloning exclusion labels
     if (labels.contains('לא_לתרגום') || labels.contains(CLONED_LABEL)) {
-        if (DEBUG) println "    ❌ Has exclusion label"
         return false
     }
 
     String issueTypeName = (fields['issuetype'] as Map<String, Object>)['name'] as String
-    if (DEBUG) println "    Issue type: ${issueTypeName}"
 
     def languageField = fields[FIELD_IDS.LANGUAGE]
     String issueLanguage = null
     if (languageField instanceof Map) {
         issueLanguage = (languageField['value'] ?: '') as String
     }
-    if (DEBUG) println "    Language: ${issueLanguage}"
 
     def translatedToField = fields[FIELD_IDS.ARTICLE_TRANSLATED_TO]
-    if (DEBUG) println "    Translated To Field Type: ${translatedToField?.getClass()?.name}"
-    if (DEBUG) println "    Translated To Field Raw: ${translatedToField}"
-
     List<String> translatedTo = []
     if (translatedToField instanceof List) {
         translatedTo = translatedToField.collect {
@@ -121,21 +122,31 @@ boolean needsTranslation(Map<String, Object> issue, String lang) {
         def value = translatedToField['value'] ?: translatedToField['id']
         translatedTo = [value as String]
     }
-    if (DEBUG) println "    Translated To List: ${translatedTo}"
-    if (DEBUG) println "    Contains ${lang}? ${translatedTo.contains(lang)}"
 
-    boolean shouldTranslate = issueLanguage == 'Hebrew' &&
-                            ISSUE_TYPE_MAPPING.containsKey(issueTypeName) &&
-                            translatedTo.contains(lang)
+    return issueLanguage == 'Hebrew' &&
+           ISSUE_TYPE_MAPPING.containsKey(issueTypeName) &&
+           translatedTo.contains(lang)
+}
 
-    if (DEBUG) println "    Result: ${shouldTranslate ? '✅ SHOULD TRANSLATE' : '❌ SKIP'}"
+boolean needsTranslation(Map<String, Object> issue, String lang) {
+    String issueKey = issue['key'] as String
+    Map<String, Object> fields = issue['fields'] as Map<String, Object>
 
-    if (shouldTranslate) {
+    if (DEBUG) println "  Checking ${issueKey} for ${lang}..."
+
+    // First check if parent qualifies (fast check, no API calls)
+    if (parentQualifiesForTranslation(issue, lang)) {
+        if (DEBUG) println "    ✅ Parent qualifies"
         return true
     }
 
-    // Check subtasks before deciding final exclusion
+    // Only check subtasks if parent doesn't qualify
     List<Map<String, Object>> subtasks = fields['subtasks'] as List<Map<String, Object>> ?: []
+    if (subtasks.isEmpty()) {
+        if (DEBUG) println "    ❌ No subtasks to check"
+        return false
+    }
+
     boolean hasTranslatableSubtask = subtasks.any { Map<String, Object> subtask ->
         Map<String, Object> subtaskFull = getSubtaskDetails(subtask['key'] as String)
         if (!subtaskFull) return false
@@ -166,14 +177,18 @@ boolean needsTranslation(Map<String, Object> issue, String lang) {
                subtaskTranslatedTo.contains(lang)
     }
 
+    if (DEBUG) println "    ${hasTranslatableSubtask ? '✅ Has translatable subtask' : '❌ No translatable subtasks'}"
     return hasTranslatableSubtask
 }
 
-int countTranslatableSubtasks(Map<String, Object> issue, String lang) {
+// Count translatable subtasks for BOTH languages in one pass
+Map<String, Integer> countTranslatableSubtasksForBothLanguages(Map<String, Object> issue) {
     Map<String, Object> fields = issue['fields'] as Map<String, Object>
     List<Map<String, Object>> subtasks = fields['subtasks'] as List<Map<String, Object>> ?: []
 
-    int count = 0
+    int arCount = 0
+    int ruCount = 0
+
     subtasks.each { Map<String, Object> subtask ->
         Map<String, Object> subtaskFull = getSubtaskDetails(subtask['key'] as String)
         if (!subtaskFull) return
@@ -181,10 +196,18 @@ int countTranslatableSubtasks(Map<String, Object> issue, String lang) {
         Map<String, Object> subtaskFields = subtaskFull['fields'] as Map<String, Object>
         String subtaskTypeName = (subtaskFields['issuetype'] as Map<String, Object>)['name'] as String
 
+        if (subtaskTypeName != 'משימת משנה') {
+            return
+        }
+
         def subtaskLanguageField = subtaskFields[FIELD_IDS.LANGUAGE]
         String subtaskLanguage = null
         if (subtaskLanguageField instanceof Map) {
             subtaskLanguage = (subtaskLanguageField['value'] ?: '') as String
+        }
+
+        if (subtaskLanguage != 'Hebrew') {
+            return
         }
 
         def subtaskTranslatedToField = subtaskFields[FIELD_IDS.ARTICLE_TRANSLATED_TO]
@@ -199,14 +222,11 @@ int countTranslatableSubtasks(Map<String, Object> issue, String lang) {
             subtaskTranslatedTo = [value as String]
         }
 
-        if (subtaskTypeName == 'משימת משנה' &&
-            subtaskLanguage == 'Hebrew' &&
-            subtaskTranslatedTo.contains(lang)) {
-            count++
-        }
+        if (subtaskTranslatedTo.contains('ar')) arCount++
+        if (subtaskTranslatedTo.contains('ru')) ruCount++
     }
 
-    return count
+    return [ar: arCount, ru: ruCount]
 }
 
 // Main execution
@@ -221,6 +241,9 @@ try {
     LocalDateTime cutoffDate = LocalDateTime.now().minusMonths(LOOKBACK_MONTHS)
     String cutoffDateStr = cutoffDate.format(DateTimeFormatter.ofPattern('yyyy-MM-dd'))
     println "Looking back: ${LOOKBACK_MONTHS} months (from ${cutoffDateStr})"
+    if (MAX_ISSUES_TO_PROCESS > 0) {
+        println "Max issues to process: ${MAX_ISSUES_TO_PROCESS}"
+    }
     println ""
 
     // Search for potential candidates
@@ -284,36 +307,59 @@ try {
 
     println "Found ${candidates.size()} candidate issues. Analyzing...\n"
 
+    // Clear cache at start
+    subtaskCache.clear()
+
+    // Limit processing if configured
+    int issuesToProcess = MAX_ISSUES_TO_PROCESS > 0 ?
+        Math.min(candidates.size(), MAX_ISSUES_TO_PROCESS) : candidates.size()
+
+    if (issuesToProcess < candidates.size()) {
+        println "Processing first ${issuesToProcess} of ${candidates.size()} issues\n"
+        candidates = candidates.take(issuesToProcess)
+    }
+
     // Analyze each candidate for both languages
-    candidates.each { Map<String, Object> issue ->
+    candidates.eachWithIndex { Map<String, Object> issue, int idx ->
         String issueKey = issue['key'] as String
         Map<String, Object> fields = issue['fields'] as Map<String, Object>
         String summary = fields['summary'] as String
         String resolved = (fields['resolved'] ?: fields['resolutiondate'] ?: fields['created']) as String
-        List<Map<String, Object>> subtasks = fields['subtasks'] as List<Map<String, Object>> ?: []
 
-        // Check for Arabic
-        if (needsTranslation(issue, 'ar')) {
-            int subtaskCount = countTranslatableSubtasks(issue, 'ar')
-            arabicIssues << [
-                key: issueKey,
-                summary: summary,
-                resolved: resolved,
-                subtaskCount: subtaskCount
-            ]
+        // Show progress every 50 issues
+        if ((idx + 1) % 50 == 0) {
+            println "  Analyzed ${idx + 1} of ${issuesToProcess} issues... (cache: ${subtaskCache.size()} subtasks)"
         }
 
-        // Check for Russian
-        if (needsTranslation(issue, 'ru')) {
-            int subtaskCount = countTranslatableSubtasks(issue, 'ru')
-            russianIssues << [
-                key: issueKey,
-                summary: summary,
-                resolved: resolved,
-                subtaskCount: subtaskCount
-            ]
+        // Check both languages
+        boolean needsAr = needsTranslation(issue, 'ar')
+        boolean needsRu = needsTranslation(issue, 'ru')
+
+        // If either language needs translation, count subtasks once for both
+        if (needsAr || needsRu) {
+            Map<String, Integer> subtaskCounts = countTranslatableSubtasksForBothLanguages(issue)
+
+            if (needsAr) {
+                arabicIssues << [
+                    key: issueKey,
+                    summary: summary,
+                    resolved: resolved,
+                    subtaskCount: subtaskCounts['ar']
+                ]
+            }
+
+            if (needsRu) {
+                russianIssues << [
+                    key: issueKey,
+                    summary: summary,
+                    resolved: resolved,
+                    subtaskCount: subtaskCounts['ru']
+                ]
+            }
         }
     }
+
+    println "  Analysis complete. (${subtaskCache.size()} unique subtasks fetched)\n"
 
     // Sort by resolved date
     arabicIssues.sort { it.resolved }
