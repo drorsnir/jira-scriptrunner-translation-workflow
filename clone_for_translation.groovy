@@ -330,8 +330,8 @@ boolean needsTranslation(Map<String, Object> issue, String lang) {
         }
 
         List<String> labels = fields['labels'] as List<String> ?: []
-        // Check for cloning exclusion labels
-        if (labels.contains('לא_לתרגום') || labels.contains(CLONED_LABEL)) {
+        // Check for permanent exclusion label
+        if (labels.contains('לא_לתרגום')) {
             log('WARN', "Issue excluded from translation due to exclusion label", [
                 issueKey: issueKey,
                 language: lang,
@@ -340,15 +340,6 @@ boolean needsTranslation(Map<String, Object> issue, String lang) {
             return false
         }
 
-        // Skip if locked by another automation (race condition prevention)
-        if (labels.contains(LOCK_LABEL)) {
-            log('WARN', "Issue locked by another automation, skipping", [
-                issueKey: issueKey,
-                language: lang
-            ])
-            return false
-        }
-        
         String issueTypeName = (fields['issuetype'] as Map<String, Object>)['name'] as String
         log('INFO', """Issue Type: ${issueTypeName}
         Has Type Mapping: ${ISSUE_TYPE_MAPPING.containsKey(issueTypeName)}
@@ -364,7 +355,13 @@ boolean needsTranslation(Map<String, Object> issue, String lang) {
         def translatedToField = fields[FIELD_IDS.ARTICLE_TRANSLATED_TO]
         List<String> translatedTo = []
         if (translatedToField instanceof List) {
-            translatedTo = translatedToField.collect { it['value'] as String }
+            translatedTo = translatedToField.collect {
+                def value = it['value'] ?: it['id']
+                value as String
+            }
+        } else if (translatedToField instanceof Map) {
+            def value = translatedToField['value'] ?: translatedToField['id']
+            translatedTo = [value as String]
         }
         log('INFO', """Translated To Field: ${translatedToField}
         Translated To List: ${translatedTo}
@@ -399,7 +396,13 @@ boolean needsTranslation(Map<String, Object> issue, String lang) {
             def subtaskTranslatedToField = subtaskFields[FIELD_IDS.ARTICLE_TRANSLATED_TO]
             List<String> subtaskTranslatedTo = []
             if (subtaskTranslatedToField instanceof List) {
-                subtaskTranslatedTo = subtaskTranslatedToField.collect { it['value'] as String }
+                subtaskTranslatedTo = subtaskTranslatedToField.collect {
+                    def value = it['value'] ?: it['id']
+                    value as String
+                }
+            } else if (subtaskTranslatedToField instanceof Map) {
+                def value = subtaskTranslatedToField['value'] ?: subtaskTranslatedToField['id']
+                subtaskTranslatedTo = [value as String]
             }
 
             return subtaskTypeName == 'משימת משנה' &&
@@ -598,43 +601,6 @@ ${fields.collect { key, value -> "${key}: (${value?.getClass()?.name}) ${groovy.
                 log('ERROR', "Failed to create clone link", linkErrorInfo)
                 addError(linkErrorInfo)
             }
-            
-            // Update labels on the original issue: remove lock, add cloned marker
-            if (!isSubtask) {  // Only update labels on parent issues
-                List<String> currentLabels = originalIssue['fields']['labels'] as List<String> ?: []
-
-                // Remove lock label
-                currentLabels.remove(LOCK_LABEL)
-
-                // Add cloned label
-                if (!currentLabels.contains(CLONED_LABEL)) {
-                    currentLabels.add(CLONED_LABEL)
-                }
-
-                def labelResponse = put("/rest/api/3/issue/${originalKey}")
-                    .header('Content-Type', 'application/json')
-                    .body([
-                        fields: [
-                            labels: currentLabels
-                        ]
-                    ])
-                    .asObject(Map)
-
-                if (labelResponse['status'] != 204) {
-                    log('WARN', "Failed to update labels on original issue", [
-                        issueKey: originalKey,
-                        status: labelResponse['status'],
-                        body: labelResponse['body']
-                    ])
-                    // Non-critical error, don't add to EXECUTION_ERRORS
-                } else {
-                    log('INFO', "Updated labels on original issue", [
-                        issueKey: originalKey,
-                        removedLabel: LOCK_LABEL,
-                        addedLabel: CLONED_LABEL
-                    ])
-                }
-            }
 
             return [
                 'key': newIssueKey,
@@ -690,174 +656,6 @@ ${fields.collect { key, value -> "${key}: (${value?.getClass()?.name}) ${groovy.
     }
 }
 
-void processIssue(Map<String, Object> currentIssue, String lang) {
-    String issueKey = currentIssue['key'] as String
-    Map<String, Object> fields = currentIssue['fields'] as Map<String, Object>
-    String issueTypeName = (fields['issuetype'] as Map<String, Object>)['name'] as String
-
-    log('INFO', "Processing issue for translation", [
-        issueKey: issueKey,
-        language: lang
-    ])
-
-    try {
-        // Add lock label to prevent race conditions with other automation
-        List<String> currentLabels = fields['labels'] as List<String> ?: []
-        if (!currentLabels.contains(LOCK_LABEL)) {
-            currentLabels.add(LOCK_LABEL)
-            def lockResponse = put("/rest/api/3/issue/${issueKey}")
-                .header('Content-Type', 'application/json')
-                .body([fields: [labels: currentLabels]])
-                .asObject(Map)
-
-            if (lockResponse['status'] == 204) {
-                log('INFO', "Added lock label to issue", [issueKey: issueKey])
-            } else {
-                log('WARN', "Failed to add lock label", [
-                    issueKey: issueKey,
-                    status: lockResponse['status']
-                ])
-            }
-        }
-
-        if (needsTranslation(currentIssue, lang)) {
-            log('INFO', "Creating translation issue", [
-                sourceKey: issueKey,
-                language: lang
-            ])  
-
-            Map<String, Object> result = createIssue(currentIssue, lang)
-            List<Tuple2<String, String>> subtaskMappings = []
-
-            if (result['status'] == 'success') {
-                String newIssueKey = result['key'] as String
-                log('INFO', "Successfully created translation issue", [
-                    sourceKey: issueKey,
-                    newKey: newIssueKey,
-                    language: lang
-                ])
-
-                // Process subtasks
-                List<Map<String, Object>> subtasks = fields['subtasks'] as List<Map<String, Object>> ?: []
-
-                subtasks.each { Map<String, Object> subtask ->
-                    String subtaskKey = subtask['key'] as String
-                    Map<String, Object> subtaskFull = getSubtaskDetails(subtaskKey)
-                    if (subtaskFull) {
-                        Map<String, Object> subtaskFields = subtaskFull['fields'] as Map<String, Object>
-                        def translatedToField = subtaskFields[FIELD_IDS.ARTICLE_TRANSLATED_TO]
-                        List<String> translatedTo = []
-
-                        if (translatedToField instanceof List) {
-                            translatedTo = translatedToField.collect { it['value'] as String }
-                        } else if (translatedToField instanceof Map) {
-                            translatedTo = [translatedToField['value'] as String]
-                        }
-
-                        if (translatedTo.contains(lang)) {
-                            log('INFO', "Creating translation subtask", [
-                                sourceKey: subtaskKey,
-                                parentKey: newIssueKey,
-                                language: lang
-                            ])
-
-                            Map<String, Object> subtaskResult = createIssue(subtaskFull, lang, true, newIssueKey)
-
-                            if (subtaskResult['status'] == 'success') {
-                                subtaskMappings << new Tuple2(subtaskKey, subtaskResult['key'])
-                                log('INFO', "Successfully created translation subtask", [
-                                    sourceKey: subtaskKey,
-                                    newKey: subtaskResult['key'],
-                                    parentKey: newIssueKey,
-                                    language: lang
-                                ])
-                            } else {
-                                log('ERROR', "Failed to create translation subtask", [
-                                    sourceKey: subtaskKey,
-                                    parentKey: newIssueKey,
-                                    language: lang,
-                                    error: subtaskResult['message']
-                                ])
-                                // Error already added in createIssue
-                            }
-                        }
-                    }
-                }
-
-                // Print summary after all processing is complete
-                printTranslationSummary(
-                    issueKey,
-                    issueTypeName,
-                    newIssueKey,
-                    ISSUE_TYPE_MAPPING[issueTypeName],
-                    lang,
-                    subtaskMappings
-                )
-            } else {
-                log('ERROR', "Failed to create translation issue", [
-                    sourceKey: issueKey,
-                    language: lang,
-                    error: result['message']
-                ])
-                // Error already added in createIssue
-                // Remove lock so issue can be retried
-                removeLockLabel(issueKey, fields)
-            }
-        } else {
-            log('INFO', "No translation needed", [
-                issueKey: issueKey,
-                language: lang
-            ])
-            // Remove lock since we're not processing
-            removeLockLabel(issueKey, fields)
-        }
-    } catch (Exception e) {
-        Map<String, Object> errorInfo = [
-            type: 'PROCESS_ISSUE_EXCEPTION',
-            message: "Exception processing issue: ${e.message}",
-            issueKey: issueKey,
-            language: lang,
-            exception: e.class.name,
-            stackTrace: e.stackTrace.take(5)*.toString(),
-            critical: true
-        ]
-
-        log('ERROR', "Exception in processIssue", errorInfo)
-        addError(errorInfo)
-
-        // Remove lock so issue can be retried
-        try {
-            removeLockLabel(issueKey, fields)
-        } catch (Exception lockEx) {
-            log('WARN', "Failed to remove lock after exception", [issueKey: issueKey, error: lockEx.message])
-        }
-
-        // Re-throw to be caught by main execution
-        throw e
-    }
-}
-
-// Helper function to remove lock label
-void removeLockLabel(String issueKey, Map<String, Object> fields) {
-    List<String> currentLabels = fields['labels'] as List<String> ?: []
-    if (currentLabels.contains(LOCK_LABEL)) {
-        currentLabels.remove(LOCK_LABEL)
-        def unlockResponse = put("/rest/api/3/issue/${issueKey}")
-            .header('Content-Type', 'application/json')
-            .body([fields: [labels: currentLabels]])
-            .asObject(Map)
-
-        if (unlockResponse['status'] == 204) {
-            log('INFO', "Removed lock label from issue", [issueKey: issueKey])
-        } else {
-            log('WARN', "Failed to remove lock label", [
-                issueKey: issueKey,
-                status: unlockResponse['status']
-            ])
-        }
-    }
-}
-
 // Main execution
 try {
     // Clear errors at start of execution
@@ -867,6 +665,25 @@ try {
         // Get the issue key from the event
         String issueKey = (issue as Map<String, Object>)['key'] as String
         log('INFO', "Starting post function execution", [issueKey: issueKey])
+
+        // Check if resolution field changed (webhook-specific check)
+        if (binding.hasVariable('changelog') && changelog) {
+            Map<String, Object> changelogData = changelog as Map<String, Object>
+            List<Map<String, Object>> items = changelogData['items'] as List<Map<String, Object>> ?: []
+
+            boolean resolutionChanged = items.any { item ->
+                (item['field'] as String) == 'resolution'
+            }
+
+            if (!resolutionChanged) {
+                log('INFO', "Resolution field not changed, skipping execution", [issueKey: issueKey])
+                return
+            }
+
+            log('INFO', "Resolution field changed, proceeding with execution", [issueKey: issueKey])
+        } else {
+            log('WARN', "No changelog available, proceeding anyway", [issueKey: issueKey])
+        }
         
         try {
             // Fetch fresh issue data from REST API, because the event's `issue` isn't fully compatible
@@ -888,17 +705,187 @@ try {
             }
             
             Map<String, Object> currentIssue = response['body'] as Map<String, Object>
-            
-// Process for each language
+            Map<String, Object> fields = currentIssue['fields'] as Map<String, Object>
+            List<String> currentLabels = fields['labels'] as List<String> ?: []
+
+            // Check for exclusion labels before processing any language
+            if (currentLabels.contains(CLONED_LABEL)) {
+                log('INFO', "Issue already cloned, skipping", [issueKey: issueKey])
+                return
+            }
+
+            // Skip if locked by another automation (race condition prevention)
+            if (currentLabels.contains(LOCK_LABEL)) {
+                log('INFO', "Issue locked by another automation, skipping", [issueKey: issueKey])
+                return
+            }
+
+            // Add lock label to prevent race conditions with other automation
+            if (!currentLabels.contains(LOCK_LABEL)) {
+                currentLabels.add(LOCK_LABEL)
+                def lockResponse = put("/rest/api/3/issue/${issueKey}?notifyUsers=false")
+                    .header('Content-Type', 'application/json')
+                    .body([fields: [labels: currentLabels]])
+                    .asObject(Map)
+
+                if (lockResponse['status'] == 204) {
+                    log('INFO', "Added lock label to issue", [issueKey: issueKey])
+                } else {
+                    log('WARN', "Failed to add lock label", [
+                        issueKey: issueKey,
+                        status: lockResponse['status']
+                    ])
+                }
+            }
+
+            // Track successful language processing
+            List<String> successfulLanguages = []
+
+            // Process for each language
             ['ar', 'ru'].each { String lang ->
                 try {
-                    processIssue(currentIssue, lang)
+                    // Check if this specific language needs translation
+                    if (needsTranslation(currentIssue, lang)) {
+                        log('INFO', "Creating translation issue", [
+                            sourceKey: issueKey,
+                            language: lang
+                        ])
+
+                        Map<String, Object> result = createIssue(currentIssue, lang)
+                        List<Tuple2<String, String>> subtaskMappings = []
+
+                        if (result['status'] == 'success') {
+                            String newIssueKey = result['key'] as String
+                            successfulLanguages << lang
+                            log('INFO', "Successfully created translation issue", [
+                                sourceKey: issueKey,
+                                newKey: newIssueKey,
+                                language: lang
+                            ])
+
+                            // Process subtasks
+                            List<Map<String, Object>> subtasks = fields['subtasks'] as List<Map<String, Object>> ?: []
+
+                            subtasks.each { Map<String, Object> subtask ->
+                                String subtaskKey = subtask['key'] as String
+                                Map<String, Object> subtaskFull = getSubtaskDetails(subtaskKey)
+                                if (subtaskFull) {
+                                    Map<String, Object> subtaskFields = subtaskFull['fields'] as Map<String, Object>
+                                    def translatedToField = subtaskFields[FIELD_IDS.ARTICLE_TRANSLATED_TO]
+                                    List<String> translatedTo = []
+
+                                    if (translatedToField instanceof List) {
+                                        translatedTo = translatedToField.collect {
+                                            def value = it['value'] ?: it['id']
+                                            value as String
+                                        }
+                                    } else if (translatedToField instanceof Map) {
+                                        def value = translatedToField['value'] ?: translatedToField['id']
+                                        translatedTo = [value as String]
+                                    }
+
+                                    if (translatedTo.contains(lang)) {
+                                        log('INFO', "Creating translation subtask", [
+                                            sourceKey: subtaskKey,
+                                            parentKey: newIssueKey,
+                                            language: lang
+                                        ])
+
+                                        Map<String, Object> subtaskResult = createIssue(subtaskFull, lang, true, newIssueKey)
+
+                                        if (subtaskResult['status'] == 'success') {
+                                            subtaskMappings << new Tuple2(subtaskKey, subtaskResult['key'])
+                                            log('INFO', "Successfully created translation subtask", [
+                                                sourceKey: subtaskKey,
+                                                newKey: subtaskResult['key'],
+                                                parentKey: newIssueKey,
+                                                language: lang
+                                            ])
+                                        } else {
+                                            log('ERROR', "Failed to create translation subtask", [
+                                                sourceKey: subtaskKey,
+                                                parentKey: newIssueKey,
+                                                language: lang,
+                                                error: subtaskResult['message']
+                                            ])
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Print summary after all processing is complete
+                            String issueTypeName = (fields['issuetype'] as Map<String, Object>)['name'] as String
+                            printTranslationSummary(
+                                issueKey,
+                                issueTypeName,
+                                newIssueKey,
+                                ISSUE_TYPE_MAPPING[issueTypeName],
+                                lang,
+                                subtaskMappings
+                            )
+                        } else {
+                            log('ERROR', "Failed to create translation issue", [
+                                sourceKey: issueKey,
+                                language: lang,
+                                error: result['message']
+                            ])
+                        }
+                    } else {
+                        log('INFO', "No translation needed", [
+                            issueKey: issueKey,
+                            language: lang
+                        ])
+                    }
                 } catch (Exception e) {
                     // Error already logged and added in processIssue
                     log('ERROR', "Failed to process issue for language ${lang}", [
                         issueKey: issueKey,
                         language: lang,
                         error: e.message
+                    ])
+                }
+            }
+
+            // Update labels after processing all languages
+            if (!successfulLanguages.isEmpty()) {
+                // Remove lock label and add cloned label
+                currentLabels.remove(LOCK_LABEL)
+                if (!currentLabels.contains(CLONED_LABEL)) {
+                    currentLabels.add(CLONED_LABEL)
+                }
+
+                def labelResponse = put("/rest/api/3/issue/${issueKey}?notifyUsers=false")
+                    .header('Content-Type', 'application/json')
+                    .body([fields: [labels: currentLabels]])
+                    .asObject(Map)
+
+                if (labelResponse['status'] == 204) {
+                    log('INFO', "Updated labels on original issue", [
+                        issueKey: issueKey,
+                        successfulLanguages: successfulLanguages,
+                        removedLabel: LOCK_LABEL,
+                        addedLabel: CLONED_LABEL
+                    ])
+                } else {
+                    log('WARN', "Failed to update labels on original issue", [
+                        issueKey: issueKey,
+                        status: labelResponse['status']
+                    ])
+                }
+            } else {
+                // Remove lock label since no processing succeeded
+                currentLabels.remove(LOCK_LABEL)
+                def unlockResponse = put("/rest/api/3/issue/${issueKey}?notifyUsers=false")
+                    .header('Content-Type', 'application/json')
+                    .body([fields: [labels: currentLabels]])
+                    .asObject(Map)
+
+                if (unlockResponse['status'] == 204) {
+                    log('INFO', "Removed lock label from issue", [issueKey: issueKey])
+                } else {
+                    log('WARN', "Failed to remove lock label", [
+                        issueKey: issueKey,
+                        status: unlockResponse['status']
                     ])
                 }
             }
@@ -1017,17 +1004,30 @@ ${nonCriticalErrors.collect { err ->
         // Script Console testing mode
         String testIssueKey = 'STAG-188'  // Change this to your test issue
         log('INFO', "Starting test execution", [testIssueKey: testIssueKey])
-        
+
         try {
             def testResponse = get("/rest/api/3/issue/${testIssueKey}").asObject(Map)
             if (testResponse['status'] == 200) {
                 Map<String, Object> testIssue = testResponse['body'] as Map<String, Object>
-                
+                log('WARN', "Test mode is using the old direct processing approach. Consider updating test mode to match production logic.")
+
+                // For test mode, we'll still process both languages without label locking
+                // to allow for easier testing. Production uses proper label management.
                 ['ar', 'ru'].each { String lang ->
                     try {
-                        processIssue(testIssue, lang)
+                        if (needsTranslation(testIssue, lang)) {
+                            log('INFO', "Test: Would create translation issue for ${lang}", [
+                                testIssueKey: testIssueKey,
+                                language: lang
+                            ])
+                        } else {
+                            log('INFO', "Test: No translation needed for ${lang}", [
+                                testIssueKey: testIssueKey,
+                                language: lang
+                            ])
+                        }
                     } catch (Exception e) {
-                        log('ERROR', "Failed to process test issue for language ${lang}", [
+                        log('ERROR', "Failed to check test issue for language ${lang}", [
                             testIssueKey: testIssueKey,
                             language: lang,
                             error: e.message
