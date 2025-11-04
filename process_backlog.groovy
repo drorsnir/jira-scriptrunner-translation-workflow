@@ -422,7 +422,18 @@ Map<String, Object> processIssue(Map<String, Object> currentIssue, String lang) 
             language: lang
         ])
 
-        Map<String, Object> result = createIssue(currentIssue, lang)
+        // Refetch the full issue details to ensure we have ALL fields for copying
+        def fullIssueResponse = get("/rest/api/3/issue/${issueKey}").asObject(Map)
+        if (fullIssueResponse['status'] != 200) {
+            log('ERROR', "Failed to fetch full issue details before cloning", [
+                issueKey: issueKey,
+                status: fullIssueResponse['status']
+            ])
+            return [status: 'error', language: lang, message: "Failed to fetch full issue details"]
+        }
+        Map<String, Object> fullIssue = fullIssueResponse['body'] as Map<String, Object>
+
+        Map<String, Object> result = createIssue(fullIssue, lang)
         List<Tuple2<String, String>> subtaskMappings = []
 
         if (result['status'] == 'success') {
@@ -433,7 +444,7 @@ Map<String, Object> processIssue(Map<String, Object> currentIssue, String lang) 
                 language: lang
             ])
 
-            // Process subtasks
+            // Process subtasks (use original currentIssue since subtasks are fetched separately)
             List<Map<String, Object>> subtasks = fields['subtasks'] as List<Map<String, Object>> ?: []
 
             subtasks.each { Map<String, Object> subtask ->
